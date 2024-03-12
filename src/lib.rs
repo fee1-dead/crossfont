@@ -210,7 +210,7 @@ impl Size {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RasterizedGlyph {
     pub id: GlyphId,
     pub width: i32,
@@ -221,7 +221,7 @@ pub struct RasterizedGlyph {
     pub buffer: BitmapBuffer,
 }
 
-#[derive(Debug, Clone, Debug)]
+#[derive(Debug, Clone)]
 pub enum BitmapBuffer {
     /// RGB alphamask.
     Rgb(Vec<u8>),
@@ -257,7 +257,7 @@ impl fmt::Debug for RasterizedGlyph {
     }
 }
 
-#[derive(DebugCopy, Clone)]
+#[derive(Clone)]
 pub struct Metrics {
     pub average_advance: f64,
     pub line_height: f64,

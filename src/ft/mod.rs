@@ -208,8 +208,8 @@ impl Rasterize for FreeTypeRasterizer {
         self.get_rendered_glyph(glyph_key)
     }
 
-    fn update_dpr(&mut self, device_pixel_ratio: f32) {
-        self.device_pixel_ratio = device_pixel_ratio;
+    fn kerning(&mut self, _left: GlyphKey, _right: GlyphKey) -> (f32, f32) {
+        (0., 0.)
     }
 
     fn font_path(&self, key: FontKey) -> Result<&std::path::Path, Error> {
@@ -337,7 +337,7 @@ impl FreeTypeRasterizer {
             if let Some(face) = self.loader.faces.get(&glyph_key.font_key) {
                 let index = face.0.ft_face.get_char_index(c as usize);
 
-                if index != 0 {
+                if let Some(index) = index {
                     return glyph_key.font_key;
                 }
             }
@@ -368,7 +368,7 @@ impl FreeTypeRasterizer {
                     let index = face.0.ft_face.get_char_index(c as usize);
 
                     // We found something in a current face, so let's use it.
-                    if face.ft_face.get_char_index(glyph.character as usize).is_some() {
+                    if face.0.ft_face.get_char_index(glyph.id.0 as usize).is_some() {
                         return Ok(font_key);
                     }
                 },
@@ -395,7 +395,7 @@ impl FreeTypeRasterizer {
         let face = &self.loader.faces[&font_key].0;
 
         let index = if let Some(c) = glyph_key.id.as_char() {
-            face.ft_face.get_char_index(c as usize) as u32
+            face.ft_face.get_char_index(c as usize).unwrap_or(0)
         } else {
             let val = glyph_key.id.value();
             if val == 0 {
@@ -405,11 +405,9 @@ impl FreeTypeRasterizer {
             }
         };
 
-        let pixelsize = face
-            .non_scalable
-            .unwrap_or_else(|| glyph_key.size.as_f32_pts() * self.device_pixel_ratio * 96. / 72.);
+        let pixelsize = face.non_scalable.unwrap_or_else(|| glyph_key.size.as_pt() * 96. / 72.);
 
-        if !face.colored {
+        if !face.colored_bitmap {
             face.ft_face.set_char_size(to_freetype_26_6(pixelsize), 0, 0, 0)?;
         }
 
@@ -458,13 +456,17 @@ impl FreeTypeRasterizer {
             left: glyph.bitmap_left(),
             width: pixel_width,
             height: pixel_height,
+            advance: (
+                from_freetype_26_6(glyph.advance().x) as i32,
+                from_freetype_26_6(glyph.advance().y) as i32,
+            ),
             buffer,
         };
 
         if index == MISSING_GLYPH_INDEX {
             Err(Error::MissingGlyph(rasterized_glyph))
         } else {
-            if face.colored {
+            if face.colored_bitmap {
                 let fixup_factor = match face.pixelsize_fixup_factor {
                     Some(fixup_factor) => fixup_factor,
                     None => {
@@ -754,7 +756,7 @@ impl FreeTypeLoader {
                 pixelsize_fixup_factor,
                 ft_face,
                 rgba,
-                placeholder_glyph_index,
+                placeholder_glyph_index: placeholder_glyph_index.unwrap_or(0),
             };
 
             debug!("Loaded Face {:?}", face);
