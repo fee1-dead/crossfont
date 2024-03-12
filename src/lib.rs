@@ -1,17 +1,15 @@
 //! Compatibility layer for different font engines.
 //!
-//! CoreText is used on Mac OS.
-//! FreeType is used on everything that's not Mac OS.
-//! Eventually, ClearType support will be available for windows.
+//! CoreText is used on macOS.
+//! DirectWrite is used on Windows.
+//! FreeType is used everywhere else.
 
-#![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use, clippy::wrong_pub_self_convention)]
+#![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 
 use std::fmt::{self, Display, Formatter};
-use std::ops::{Add, Mul};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// If target isn't macos or windows, reexport everything from ft.
 #[cfg(not(any(target_os = "macos", windows)))]
 pub mod ft;
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -22,11 +20,15 @@ pub mod directwrite;
 #[cfg(windows)]
 pub use directwrite::DirectWriteRasterizer as Rasterizer;
 
-// If target is macos, reexport everything from darwin.
 #[cfg(target_os = "macos")]
-mod darwin;
+pub mod darwin;
 #[cfg(target_os = "macos")]
-pub use darwin::*;
+pub use darwin::CoreTextRasterizer as Rasterizer;
+
+/// Max font size in pt.
+///
+/// The value is picked based on `u32` max, since we use 6 digits for fract.
+const MAX_FONT_PT_SIZE: f32 = 3999.;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FontDesc {
@@ -165,61 +167,61 @@ pub struct GlyphKey {
     pub size: Size,
 }
 
-/// Font size stored as integer.
+/// Font size stored as base and fraction.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Size(i16);
+pub struct Size(u32);
 
 impl Size {
     /// Create a new `Size` from a f32 size in points.
+    ///
+    /// The font size is automatically clamped to supported range of `[1.; 3999.]` pt.
     pub fn new(size: f32) -> Size {
-        Size((size * Size::factor()) as i16)
+        let size = size.clamp(1., MAX_FONT_PT_SIZE);
+        Size((size * Self::factor()) as u32)
+    }
+
+    /// Create a new `Size` from px.
+    ///
+    /// The value will be clamped to the pt range of [`Size::new`].
+    pub fn from_px(size: f32) -> Self {
+        let pt = size * 72. / 96.;
+        Size::new(pt)
+    }
+
+    /// Scale font size by the given amount.
+    pub fn scale(self, scale: f32) -> Self {
+        Self::new(self.as_pt() * scale)
+    }
+
+    /// Get size in `px`.
+    pub fn as_px(self) -> f32 {
+        self.as_pt() * 96. / 72.
+    }
+
+    /// Get the size in `pt`.
+    pub fn as_pt(self) -> f32 {
+        (f64::from(self.0) / Size::factor() as f64) as f32
     }
 
     /// Scale factor between font "Size" type and point size.
     #[inline]
-    pub fn factor() -> f32 {
-        2.0
-    }
-
-    /// Get the f32 size in points.
-    pub fn as_f32_pts(self) -> f32 {
-        f32::from(self.0) / Size::factor()
+    fn factor() -> f32 {
+        1_000_000.
     }
 }
 
-impl<T: Into<Size>> Add<T> for Size {
-    type Output = Size;
-
-    fn add(self, other: T) -> Size {
-        Size(self.0.saturating_add(other.into().0))
-    }
-}
-
-impl<T: Into<Size>> Mul<T> for Size {
-    type Output = Size;
-
-    fn mul(self, other: T) -> Size {
-        Size(self.0 * other.into().0)
-    }
-}
-
-impl From<f32> for Size {
-    fn from(float: f32) -> Size {
-        Size::new(float)
-    }
-}
-
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RasterizedGlyph {
     pub id: GlyphId,
     pub width: i32,
     pub height: i32,
     pub top: i32,
     pub left: i32,
+    pub advance: (i32, i32),
     pub buffer: BitmapBuffer,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, Debug)]
 pub enum BitmapBuffer {
     /// RGB alphamask.
     Rgb(Vec<u8>),
@@ -236,6 +238,7 @@ impl Default for RasterizedGlyph {
             height: 0,
             top: 0,
             left: 0,
+            advance: (0, 0),
             buffer: BitmapBuffer::Rgb(Vec::new()),
         }
     }
@@ -254,7 +257,7 @@ impl fmt::Debug for RasterizedGlyph {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(DebugCopy, Clone)]
 pub struct Metrics {
     pub average_advance: f64,
     pub line_height: f64,
@@ -304,7 +307,7 @@ impl Display for Error {
 
 pub trait Rasterize {
     /// Create a new Rasterizer.
-    fn new(device_pixel_ratio: f32, use_thin_strokes: bool) -> Result<Self, Error>
+    fn new() -> Result<Self, Error>
     where
         Self: Sized;
 
@@ -317,8 +320,8 @@ pub trait Rasterize {
     /// Rasterize the glyph described by `GlyphKey`..
     fn get_glyph(&mut self, _: GlyphKey) -> Result<RasterizedGlyph, Error>;
 
-    /// Update the Rasterizer's DPI factor.
-    fn update_dpr(&mut self, device_pixel_ratio: f32);
+    /// Kerning between two characters.
+    fn kerning(&mut self, left: GlyphKey, right: GlyphKey) -> (f32, f32);
 
     /// Get the path of a font by its key.
     ///

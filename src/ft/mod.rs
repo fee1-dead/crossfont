@@ -59,7 +59,7 @@ pub struct FaceLoadingProperties {
     render_mode: freetype::RenderMode,
     lcd_filter: c_uint,
     non_scalable: Option<f32>,
-    colored: bool,
+    colored_bitmap: bool,
     embolden: bool,
     matrix: Option<Matrix>,
     pixelsize_fixup_factor: Option<f64>,
@@ -73,14 +73,18 @@ impl fmt::Debug for FaceLoadingProperties {
         f.debug_struct("Face")
             .field("ft_face", &self.ft_face)
             .field("load_flags", &self.load_flags)
-            .field("render_mode", &match self.render_mode {
-                freetype::RenderMode::Normal => "Normal",
-                freetype::RenderMode::Light => "Light",
-                freetype::RenderMode::Mono => "Mono",
-                freetype::RenderMode::Lcd => "Lcd",
-                freetype::RenderMode::LcdV => "LcdV",
-                freetype::RenderMode::Max => "Max",
-            })
+            .field(
+                "render_mode",
+                &match self.render_mode {
+                    freetype::RenderMode::Normal => "Normal",
+                    freetype::RenderMode::Light => "Light",
+                    freetype::RenderMode::Mono => "Mono",
+                    freetype::RenderMode::Lcd => "Lcd",
+                    freetype::RenderMode::LcdV => "LcdV",
+                    freetype::RenderMode::Max => "Max",
+                    freetype::RenderMode::Sdf => "Sdf",
+                },
+            )
             .field("lcd_filter", &self.lcd_filter)
             .finish()
     }
@@ -90,7 +94,6 @@ impl fmt::Debug for FaceLoadingProperties {
 pub struct FreeTypeRasterizer {
     loader: FreeTypeLoader,
     fallback_lists: HashMap<FontKey, FallbackList>,
-    device_pixel_ratio: f32,
 
     /// Rasterizer creation time stamp to delay lazy font config updates
     /// in `Rasterizer::load_font`.
@@ -107,12 +110,38 @@ fn to_fixedpoint_16_6(f: f64) -> c_long {
     (f * 65536.0) as c_long
 }
 
+#[inline]
+fn from_freetype_26_6(f: impl IntoF32) -> f32 {
+    f.into_f32() / 64.
+}
+
+trait IntoF32 {
+    fn into_f32(self) -> f32;
+}
+
+impl IntoF32 for f32 {
+    fn into_f32(self) -> f32 {
+        self
+    }
+}
+
+impl IntoF32 for i32 {
+    fn into_f32(self) -> f32 {
+        self as f32
+    }
+}
+
+impl IntoF32 for i64 {
+    fn into_f32(self) -> f32 {
+        self as f32
+    }
+}
+
 impl Rasterize for FreeTypeRasterizer {
-    fn new(device_pixel_ratio: f32, _: bool) -> Result<FreeTypeRasterizer, Error> {
+    fn new() -> Result<FreeTypeRasterizer, Error> {
         Ok(FreeTypeRasterizer {
             loader: FreeTypeLoader::new()?,
             fallback_lists: HashMap::new(),
-            device_pixel_ratio,
             creation_timestamp: Some(Instant::now()),
         })
     }
@@ -121,16 +150,18 @@ impl Rasterize for FreeTypeRasterizer {
         let face = &self.loader.faces.get(&key).ok_or(Error::UnknownFontKey)?.0;
         let full = self.full_metrics(face)?;
 
-        let ascent = (full.size_metrics.ascender / 64) as f32;
-        let descent = (full.size_metrics.descender / 64) as f32;
-        let glyph_height = (full.size_metrics.height / 64) as f64;
+        let ascent = from_freetype_26_6(full.size_metrics.ascender);
+        let descent = from_freetype_26_6(full.size_metrics.descender);
+        let glyph_height = from_freetype_26_6(full.size_metrics.height) as f64;
         let global_glyph_height = (ascent - descent) as f64;
         let height = f64::max(glyph_height, global_glyph_height);
 
         // Get underline position and thickness in device pixels.
         let x_scale = full.size_metrics.x_scale as f32 / 65536.0;
-        let mut underline_position = f32::from(face.ft_face.underline_position()) * x_scale / 64.;
-        let mut underline_thickness = f32::from(face.ft_face.underline_thickness()) * x_scale / 64.;
+        let ft_underline_position = face.ft_face.underline_position();
+        let mut underline_position = from_freetype_26_6(ft_underline_position as f32 * x_scale);
+        let ft_underline_thickness = face.ft_face.underline_thickness();
+        let mut underline_thickness = from_freetype_26_6(ft_underline_thickness as f32 * x_scale);
 
         // Fallback for bitmap fonts which do not provide underline metrics.
         if underline_position == 0. {
@@ -141,11 +172,10 @@ impl Rasterize for FreeTypeRasterizer {
         // Get strikeout position and thickness in device pixels.
         let (strikeout_position, strikeout_thickness) =
             match TrueTypeOS2Table::from_face(&mut (*face.ft_face).clone()) {
-                Some(os2) => {
-                    let strikeout_position = f32::from(os2.y_strikeout_position()) * x_scale / 64.;
-                    let strikeout_thickness = f32::from(os2.y_strikeout_size()) * x_scale / 64.;
-                    (strikeout_position, strikeout_thickness)
-                },
+                Some(os2) => (
+                    from_freetype_26_6(os2.y_strikeout_position() as f32 * x_scale),
+                    from_freetype_26_6(os2.y_strikeout_size() as f32 * x_scale),
+                ),
                 _ => {
                     // Fallback if font doesn't provide info about strikeout.
                     trace!("Using fallback strikeout metrics");
@@ -215,7 +245,7 @@ impl FreeTypeRasterizer {
     /// Load a font face according to `FontDesc`.
     fn get_face(&mut self, desc: &FontDesc, size: Size) -> Result<FontKey, Error> {
         // Adjust for DPR.
-        let size = f64::from(size.as_f32_pts() * self.device_pixel_ratio * 96. / 72.);
+        let size = f64::from(size.as_px());
 
         let config = fc::Config::get_current();
         let mut pattern = Pattern::new();
@@ -295,11 +325,11 @@ impl FreeTypeRasterizer {
         let size_metrics = ft_face.size_metrics().ok_or(Error::MetricsNotFound)?;
 
         let width = match ft_face.load_char('0' as usize, face_load_props.load_flags) {
-            Ok(_) => ft_face.glyph().metrics().horiAdvance / 64,
-            Err(_) => size_metrics.max_advance / 64,
-        } as f64;
+            Ok(_) => from_freetype_26_6(ft_face.glyph().metrics().horiAdvance),
+            Err(_) => from_freetype_26_6(size_metrics.max_advance),
+        };
 
-        Ok(FullMetrics { size_metrics, cell_width: width })
+        Ok(FullMetrics { size_metrics, cell_width: width as f64 })
     }
 
     fn face_for_glyph(&mut self, glyph_key: GlyphKey) -> FontKey {
@@ -338,7 +368,7 @@ impl FreeTypeRasterizer {
                     let index = face.0.ft_face.get_char_index(c as usize);
 
                     // We found something in a current face, so let's use it.
-                    if index != 0 {
+                    if face.ft_face.get_char_index(glyph.character as usize).is_some() {
                         return Ok(font_key);
                     }
                 },
@@ -462,7 +492,7 @@ impl FreeTypeRasterizer {
 
         let buf = bitmap.buffer();
         let mut packed = Vec::with_capacity((bitmap.rows() * bitmap.width()) as usize);
-        let pitch = bitmap.pitch().abs() as usize;
+        let pitch = bitmap.pitch().unsigned_abs() as usize;
         match bitmap.pixel_mode()? {
             PixelMode::Lcd => {
                 for i in 0..bitmap.rows() {
@@ -516,7 +546,7 @@ impl FreeTypeRasterizer {
                 for i in 0..(bitmap.rows() as usize) {
                     let mut columns = bitmap.width();
                     let mut byte = 0;
-                    let offset = i * bitmap.pitch().abs() as usize;
+                    let offset = i * bitmap.pitch().unsigned_abs() as usize;
                     while columns != 0 {
                         let bits = min(8, columns);
                         unpack_byte(&mut packed, buf[offset + byte], bits as u8);
@@ -657,7 +687,7 @@ impl FreeTypeLoader {
 
     fn load_ft_face(&mut self, ft_face_location: FtFaceLocation) -> Result<Rc<FtFace>, Error> {
         let mut ft_face = self.library.new_face(&ft_face_location.path, ft_face_location.index)?;
-        if ft_face.has_color() {
+        if ft_face.has_color() && !ft_face.is_scalable() {
             unsafe {
                 // Select the colored bitmap size to use from the array of available sizes.
                 freetype_sys::FT_Select_Size(ft_face.raw_mut(), 0);
@@ -718,7 +748,7 @@ impl FreeTypeLoader {
                 render_mode: Self::ft_render_mode(pattern),
                 lcd_filter: Self::ft_lcd_filter(pattern),
                 non_scalable,
-                colored: ft_face.has_color(),
+                colored_bitmap: ft_face.has_color() && !ft_face.is_scalable(),
                 embolden,
                 matrix,
                 pixelsize_fixup_factor,
